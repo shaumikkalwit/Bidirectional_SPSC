@@ -1,0 +1,5 @@
+*.exe
+*.out
+*.pdb
+.vscode/
+txt

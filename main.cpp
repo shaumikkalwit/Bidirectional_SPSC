@@ -2,10 +2,10 @@
 #include <stdio.h>
 #include <thread>
 #include <iostream>
+#include <atomic>
 
 struct Msg{
-    uint64_t curtime; 
-    float position_example[8];
+    float arrayOfNumbers[8];
     bool keepRunning;
 };
 
@@ -23,24 +23,56 @@ struct alignas(64) Ring{
     //index one past the last commited write, starts at 0
     std::atomic<size_t> tail{0};
     //index of the next item to read (consumer)
-    Msg buf[16]; //the fixed size circular buffer of payload objects
+    Msg buf[4]; //the fixed size circular buffer of payload objects
     //powewr of two length
 };
 
+bool try_push(Ring& q, const Msg& m){
+    size_t h = q.head.load(std::memory_order_relaxed); 
+    size_t t = q.tail.load(std::memory_order_acquire); 
+    if (h-t == std::size(q.buf)) //full 
+        return false; 
+    q.buf[h & 15] = m; 
+    q.head.store(h+1, std::memory_order_release);
+    return true;
+}
 
+bool try_pop(Ring& q, Msg& out){
+    size_t t = q.tail.load(std::memory_order_relaxed); 
+    size_t h = q.head.load(std::memory_order_acquire);
+    if (t==h){ //empty
+        return false;
+    }
+    out = q.buf[t & 15];
+    q.tail.store(t+1,std::memory_order_release);
+    return true;
+}
 
-void continuousThreadFunction(){
+void continuousThreadFunction(Ring& tx){
+    int i= 0;
     while(true){
-        std::cout << "Hello from new thread!" << std::endl;
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        i+=1;
+        // std::cout << "Hello from new thread!" << std::endl;
+        Msg m;
+        for(int j = 0; j < 4; j++){
+            m.arrayOfNumbers[j] = i;
+        }
+        m.keepRunning = true;
+        if (i > 30){
+            m.keepRunning = false;
+            break; 
+        }     
+        try_push(tx,m);  
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 }
 
 int main(){
     printf("hello world\n");
+    Ring rtToMain;
 
 
-    std::thread t(continuousThreadFunction);
+    std::thread t(continuousThreadFunction,std::ref(rtToMain));
 
 
     //here, thread is a class that represents a thread of execution 
@@ -54,10 +86,17 @@ int main(){
     //we will start with the communication from the "real time" simulated thread to the main thread, where 
     //the real time thread will run at a faster speed than this main thread. 
     while(true){
-        printf("message from main thread");
+        Msg recieve;
+        printf("draining queue \n");
+        while (try_pop(rtToMain,recieve)){
+            printf("keepRunning? %d \n", recieve.keepRunning);
+            printf("i %f \n", recieve.arrayOfNumbers[0]);
+        }
+        // printf("message from main thread");
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
     }
+    printf("done \n");
 
     return 0;
 }

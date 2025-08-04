@@ -1,0 +1,3 @@
+/Users/shaumikkalwit/Documents/github/SPSC_CMAKE_PROJECT/build/CMakeFiles/spsc_app.dir
+/Users/shaumikkalwit/Documents/github/SPSC_CMAKE_PROJECT/build/CMakeFiles/edit_cache.dir
+/Users/shaumikkalwit/Documents/github/SPSC_CMAKE_PROJECT/build/CMakeFiles/rebuild_cache.dir

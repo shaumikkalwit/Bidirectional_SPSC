@@ -20,19 +20,7 @@ struct Message {
 // This is critical for high-performance applications because it guarantees that
 // copying a Message can be done with a simple, fast, bit-for-bit memory copy (like memcpy),
 // without any unexpected side effects from user-defined constructors or destructors.
-static_assert(std::is_trivially_copyable_v<Message>,"msg must be trivial");
-
-struct Mailbox {
-    // Two slots are used for double-buffering. This allows the producer
-    // to write to one slot while the consumer safely reads from the other,
-    // preventing data corruption (torn reads).
-    Message slots[2];
-
-    // An atomic index is used as a controller because std::atomic is not
-    // guaranteed to work on a complex struct like Msg. This index points
-    // to the slot containing the latest, complete data.
-    alignas(64) std::atomic<int> latest_idx{0};
-};
+static_assert(std::is_trivially_copyable_v<Message>,"Message must be trivial.");
 
 /**
  * @brief A lock-free SPSC queue for the RT -> Observer data channel.
@@ -43,18 +31,25 @@ struct Mailbox {
  * for sending commands, is handled by the Mailbox.
  */
 struct alignas(64) Ring {
-    // alignas(64) prevents "false sharing" by ensuring this struct starts on a
-    // new cache line, a 64-byte boundary in memory.
-
-    /// The write index, modified only by the producer (the RT thread).
     std::atomic<size_t> head{0};
 
-    /// The read index, modified only by the consumer (the Observer thread).
     std::atomic<size_t> tail{0};
 
-    /// The underlying circular buffer that stores the messages.
-    /// Its size must be a power of two for the fast bitwise-AND indexing to work.
     Message buf[8];
+};
+
+/**
+ * @brief A lock-free SPSC mailbox for the Observer -> RT command channel.
+ *
+ * This struct implements one half of a bidirectional SPSC communication
+ * system. It serves as the "last value matters" channel for the Observer
+ * thread to send command updates to the RT thread. The other direction, for
+ * sending a stream of data, is handled by the Ring queue.
+ */
+struct Mailbox {
+    Message slots[2];
+
+    alignas(64) std::atomic<int> latest_idx{0};
 };
 
 /**
@@ -68,17 +63,11 @@ struct alignas(64) Ring {
  * @param command The Message object containing the command data
  */
 void send_command(Mailbox &mailbox, const Message &command) {
-    // Find the inactive slot to write to. 'relaxed' is fine because we don't
-    // need to synchronize other memory with this read, just get the index value.
     const int current_idx = mailbox.latest_idx.load(std::memory_order_relaxed);
     const int write_idx = 1 - current_idx;
 
-    // Write the new data into the hidden "staging" slot.
     mailbox.slots[write_idx] = command;
 
-    // Atomically publish the new data. The `release` fence ensures the write
-    // above is 100% complete before any other thread sees the new index.
-    // This is the key to preventing torn reads.
     mailbox.latest_idx.store(write_idx, std::memory_order_release);
 }
 
@@ -88,13 +77,8 @@ void send_command(Mailbox &mailbox, const Message &command) {
  * @return A copy of the latest, complete message
  */
 Message peek(Mailbox &mailbox) {
-    // Atomically load the index. The 'acquire' memory order pairs with the
-    // 'release' in the send function. This creates a "happens-before"
-    // relationship, guaranteeing that we only see the new index *after* the
-    // message write is 100% complete
     const int read_idx = mailbox.latest_idx.load(std::memory_order_acquire);
 
-    // Return a copy of the data from the slot that is now safe to read
     return mailbox.slots[read_idx];
 }
 

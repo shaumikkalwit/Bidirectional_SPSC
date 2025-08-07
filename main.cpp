@@ -4,89 +4,157 @@
 #include <iostream>
 #include <atomic>
 
-struct Msg{
+/**
+ * @brief A generic message structure for communication between threads.
+ *
+ * This simple "Plain Old Data" (POD) struct is used for both sending commands
+ * from the Observer to the RT thread and for sending data back from the RT
+ * thread to the Observer
+ */
+struct Message {
     float arrayOfNumbers[8];
     bool keepRunning;
 };
 
-//here there is an interesting command 
-static_assert(std::is_trivially_copyable_v<Msg>,"msg must be trivial");
-// this is not a function, but is a "trait" it answers " may i copy the object bit for bit with memcpy, move it in shared memory, or read it from 
-//unitialized storage without running any user defined constructors, desctors or copy/move functions! interesting!"
+// This is a compile-time check that ensures the Message struct is "trivially copyable".
+// This is critical for high-performance applications because it guarantees that
+// copying a Message can be done with a simple, fast, bit-for-bit memory copy (like memcpy),
+// without any unexpected side effects from user-defined constructors or destructors.
+static_assert(std::is_trivially_copyable_v<Message>,"msg must be trivial");
 
 struct Mailbox {
-    // this holds the messages
-    Msg slots[2];
+    // Two slots are used for double-buffering. This allows the producer
+    // to write to one slot while the consumer safely reads from the other,
+    // preventing data corruption (torn reads).
+    Message slots[2];
 
+    // An atomic index is used as a controller because std::atomic is not
+    // guaranteed to work on a complex struct like Msg. This index points
+    // to the slot containing the latest, complete data.
     alignas(64) std::atomic<int> latest_idx{0};
 };
 
-void send(Mailbox &mb, const Msg &msg) {
-    // finds the slot that is NOT being read from
-    const int current_idx = mb.latest_idx.load(std::memory_order_relaxed);
+/**
+ * @brief A lock-free SPSC queue for the RT -> Observer data channel.
+ *
+ * This struct implements one half of a bidirectional SPSC communication
+ * system. It serves as the channel for the RT thread to
+ * send a stream of data messages for the Observer thread to read from. The other direction,
+ * for sending commands, is handled by the Mailbox.
+ */
+struct alignas(64) Ring {
+    // alignas(64) prevents "false sharing" by ensuring this struct starts on a
+    // new cache line, a 64-byte boundary in memory.
+
+    /// The write index, modified only by the producer (the RT thread).
+    std::atomic<size_t> head{0};
+
+    /// The read index, modified only by the consumer (the Observer thread).
+    std::atomic<size_t> tail{0};
+
+    /// The underlying circular buffer that stores the messages.
+    /// Its size must be a power of two for the fast bitwise-AND indexing to work.
+    Message buf[8];
+};
+
+/**
+ * @brief Sends a command from the Observer thread to the RT thread
+ *
+ * This function is called by the low-frequency Observer thread to update the
+ * command state for the RT thread. It uses a double-buffer mailbox to ensure
+ * the command is sent safely without blocking and without data corruption
+ *
+ * @param mailbox The Mailbox to send the command to
+ * @param command The Message object containing the command data
+ */
+void send_command(Mailbox &mailbox, const Message &command) {
+    // Find the inactive slot to write to. 'relaxed' is fine because we don't
+    // need to synchronize other memory with this read, just get the index value.
+    const int current_idx = mailbox.latest_idx.load(std::memory_order_relaxed);
     const int write_idx = 1 - current_idx;
 
-    // write the new data into this the currently unused slot
-    mb.slots[write_idx] = msg;
+    // Write the new data into the hidden "staging" slot.
+    mailbox.slots[write_idx] = command;
 
-    // publish the new data. 'release' memory order ensures that the write to the slot above is 100% complete before the index is
-    // updated, preventing torn reads
-    mb.latest_idx.store(write_idx, std::memory_order_release);
+    // Atomically publish the new data. The `release` fence ensures the write
+    // above is 100% complete before any other thread sees the new index.
+    // This is the key to preventing torn reads.
+    mailbox.latest_idx.store(write_idx, std::memory_order_release);
 }
 
 /**
- * @brief Safely peeks at the latest message in the mailbox.
- * @param mb The mailbox to peek from.
- * @return A copy of the latest, complete message.
+ * @brief Safely peeks at the latest message in the mailbox
+ * @param mailbox The mailbox to peek from
+ * @return A copy of the latest, complete message
  */
-Msg peek(Mailbox &mb) {
-    // Atomically load the index. The 'acquire' memory order syncs with the
-    // 'release' in the send function, guaranteeing we only see the index
-    // *after* the message write is complete
-    // The reason why we need this and we cant just atomically store the message, is because the msg is a "complex struct"
-    // std::atomic is only guaranteed to work on single primitive types. Msg is too complex of a struct to read and write to quickly
-    // It would have to copy a piece of data little by little that could lead to a torn msg
-    const int read_idx = mb.latest_idx.load(std::memory_order_acquire);
+Message peek(Mailbox &mailbox) {
+    // Atomically load the index. The 'acquire' memory order pairs with the
+    // 'release' in the send function. This creates a "happens-before"
+    // relationship, guaranteeing that we only see the new index *after* the
+    // message write is 100% complete
+    const int read_idx = mailbox.latest_idx.load(std::memory_order_acquire);
 
-    // Return a copy of the data from the slot that is now safe to read.
-    return mb.slots[read_idx];
+    // Return a copy of the data from the slot that is now safe to read
+    return mailbox.slots[read_idx];
 }
 
-struct alignas(64) Ring{
-    //alignas(64) requests that the compiler place the start of the struct on a 64 
-    //byte boundary where 64B is one cache line (smallest unit of data that can be transferred between the CPU cache and main memory) on x86
-    std::atomic<size_t> head{0};
-    //index one past the last commited write, starts at 0
-    std::atomic<size_t> tail{0};
-    //index of the next item to read (consumer)
-    Msg buf[16]; //the fixed size circular buffer of payload objects
-    // power of two length
-};
+/**
+ * @brief Tries to push a data message from the RT thread into the queue
+ *
+ * This function is called by the high-frequency RT thread to send data back
+ * to the Observer thread. It is non-blocking; if the queue is full, it will
+ * immediately return false, dropping the message
+ *
+ * @param queue The queue to push the message into
+ * @param message The Message object containing the data to be pushed
+ * @return true if the message was successfully pushed, false if the queue was full
+ */
+bool try_push(Ring &queue, const Message &message) {
+    size_t h = queue.head.load(std::memory_order_relaxed);
+    size_t t = queue.tail.load(std::memory_order_acquire); 
+    if (h-t == std::size(queue.buf)) // full 
+        return false;
 
-bool try_push(Ring& q, const Msg& m) {
-    // q.head is a std::atomic, so we must use .load() to access it safely when other threads might also be using it
-    size_t h = q.head.load(std::memory_order_relaxed);
-    size_t t = q.tail.load(std::memory_order_acquire); 
-    if (h-t == std::size(q.buf)) // full 
-        return false; 
-    q.buf[h & 15] = m; 
-    q.head.store(h+1, std::memory_order_release); 
+    queue.buf[h & 7] = message; 
+    queue.head.store(h+1, std::memory_order_release); 
     return true;
 }
 
-bool try_pop(Ring& q, Msg& out){
-    size_t t = q.tail.load(std::memory_order_relaxed); 
-    size_t h = q.head.load(std::memory_order_acquire);
-    if (t==h){ //empty
+/**
+ * @brief Tries to pop a data message from the queue for the Observer thread.
+ *
+ * This function is called by the low-frequency Observer thread to read data
+ * sent by the RT thread. It is non-blocking; if the queue is empty, it will
+ * immediately return false
+ *
+ * @param queue The queue to pop the message from
+ * @param[out] out The Message object where the popped data will be stored
+ * @return true if a message was successfully popped, false if the queue was empty
+ */
+bool try_pop(Ring &queue, Message &out){
+    size_t t = queue.tail.load(std::memory_order_relaxed); 
+    size_t h = queue.head.load(std::memory_order_acquire);
+    if (t==h){ // empty
         return false;
     }
-    out = q.buf[t & 15];
-    q.tail.store(t+1,std::memory_order_release);
+
+    out = queue.buf[t & 7];
+    queue.tail.store(t+1, std::memory_order_release);
     return true;
 }
 
-// This is the RT thread, it writes the messages that the observer is meant to read x5 as slow
-void continuousThreadFunction(Ring& tx, Mailbox& mb){
+/**
+ * @brief The main function for the high-frequency Real-Time (RT) thread.
+ *
+ * This function runs in a continuous loop at a fixed rate (20ms). In each
+ * cycle, it peeks at the CommandMailbox to get the latest command from the
+ * Observer thread. It then uses that command to generate a new data message,
+ * which it pushes into the outgoing Ring queue.
+ *
+ * @param tx The Ring queue to push outgoing data messages into.
+ * @param mailbox The Mailbox to peek for incoming commands from.
+ */
+void continuousThreadFunction(Ring &tx, Mailbox &mailbox){
     int i= 0;
     auto wake_up = std::chrono::high_resolution_clock::now();
 
@@ -94,36 +162,30 @@ void continuousThreadFunction(Ring& tx, Mailbox& mb){
         wake_up += std::chrono::milliseconds(20);
         i+=1;
 
-        // peek what new command was sent from observer
-        Msg command = peek(mb);
+        Message command = peek(mailbox);
 
-        // If observer tells you to keep going, keep going
         if (!command.keepRunning) {
             break;
         }
 
-        // 
-        // std::cout << "Hello from new thread!" << std::endl;
-        Msg msg = {};
-        msg.keepRunning = true;
-        msg.arrayOfNumbers[0] = command.arrayOfNumbers[0] + static_cast<float>(i);
+        Message message = {};
+        message.keepRunning = true;
+        message.arrayOfNumbers[0] = command.arrayOfNumbers[0] + static_cast<float>(i);
 
-        // for(int j = 0; j < 8; j++){
-        //     msg.arrayOfNumbers[j] = i;
-        // }
-        try_push(tx, msg);
-        printf("  RT Thread Pushed:  %f\n", msg.arrayOfNumbers[0]);
-
-        // if (i > 30){
-        //     msg.keepRunning = false;
-        //     break; 
-        // }     
-        // try_push(tx, msg);  
+        try_push(tx, message);
+        printf("  RT Thread Pushed:  %f\n", message.arrayOfNumbers[0]);
         std::this_thread::sleep_until(wake_up);
     }
 }
 
-// This is the observer thread, waits for the msgs and reads them five times as slow
+/**
+ * @brief The main entry point of the program, acting as the low-frequency Observer thread.
+ *
+ * This function initializes the communication
+ * channels, launches the high-frequency RT thread, and then enters a loop where it
+ * simulates the work of an observer, sending new commands to the RT thread and
+ * periodically draining the data queue to process the results
+ */
 int main() {
     printf("hello world\n");
 
@@ -131,37 +193,12 @@ int main() {
     Ring rtToMain;
     Mailbox mainToRT;
 
-    Msg command = {};
+    Message command = {};
     command.keepRunning = true;
     command.arrayOfNumbers[0] = 0.0f;
-    send(mainToRT, command);
-
+    send_command(mainToRT, command);
 
     std::thread t(continuousThreadFunction, std::ref(rtToMain), std::ref(mainToRT));
-
-
-    //here, thread is a class that represents a thread of execution 
-    //t is an instance of the thread class, and threadFucntion is the parameter to the constructor
-    // t.join(); if we use t.join then we wait for that thread to finish before moving on 
-    // t.detach(); //this lets it run independently
-
-    // //now that we have the continous thread running, we can begin trying to communicate between 
-    // //the two threads using a publisher subscriber model. we will use this main thread as the other 
-    // //thread 
-    // //we will start with the communication from the "real time" simulated thread to the main thread, where 
-    // //the real time thread will run at a faster speed than this main thread. 
-    // while(true) {
-    //     Msg recieve;
-    //     printf("draining queue \n");
-    //     while (try_pop(rtToMain,recieve)){
-    //         printf("keepRunning? %d \n", recieve.keepRunning);
-    //         printf("i %f \n", recieve.arrayOfNumbers[0]);
-    //     }
-    //     // printf("message from main thread");
-    //     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-
-    // }
-
     auto wake_up = std::chrono::high_resolution_clock::now();
 
     // Loop a few times, sending a new command each time
@@ -172,25 +209,25 @@ int main() {
         // Set a new command value to send
         command.arrayOfNumbers[0] = static_cast<float>(i * 100);
         printf("Observer sending new command: %f\n", command.arrayOfNumbers[0]);
-        send(mainToRT, command);
+        send_command(mainToRT, command);
 
         // Wait a second to let the RT thread run
         std::this_thread::sleep_until(wake_up);
 
-        // now drain the rt queue to see what the RT thread produced
-        Msg msg;
+        // Now drain the rt queue to see what the RT thread produced
+        Message message;
         printf("Observer reading from RT queue:\n");
-        while (try_pop(rtToMain, msg)) {
-            printf("  > Popped RT values: %f\n", msg.arrayOfNumbers[0]);
+        while (try_pop(rtToMain, message)) {
+            printf("  > Popped RT values: %f\n", message.arrayOfNumbers[0]);
         }
     }
 
-    // tells real-time thread to shut down
+    // Tells real-time thread to shut down
     printf("\nObserver sending shutdown command...\n");
     command.keepRunning = false;
-    send(mainToRT, command);
+    send_command(mainToRT, command);
 
-    // wait for the thread to finish
+    // Wait for the thread to finish
     t.join();
     printf("done \n");
 

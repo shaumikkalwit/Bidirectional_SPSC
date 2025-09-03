@@ -1,10 +1,23 @@
-Hello! The goal of this project is to implement a bidirectional single producer single consumer architecture in a multithreaded c++ implementation. This is very similar, if not identical to what we will have to use in my research lab for communication between a real time thread, and a non real time thread. Because of the nuances with real time threads in windows, and no matter how you do it, it's always soft real time, we may or may not use the full windows media timer implementation, but instead just use the typical sleep method with 2 separate sleep rates.
+In our ongoing work on a **real-time control system** for a CDPR, one of the foundational challenges is handling **safe and efficient communication between threads,** particularly between a real-time thread that handles time-critical motor commands and a non-real-time thread that performs higher-level state machine changes and reads from the real-time thread.
 
-The second goal of this project is learn CMAKE. I have nearly exclusively been using Visual Studio 2022 to code in c++, and while it's a great development environment, I would prefer to have everything in one editor so that I don't have 2 or even maybe more editors that I am bouncing between for different projects, all that have their own quirks that you need to remember. 
+This section walks through our **C++ implementation of a bidirectional Single-Producer Single-Consumer (SPSC) architecture**, a pattern that's used in my lab's Cable-Driven Parallel Robot’s motor control. The goal is to provide **lock-free, low-latency message passing** between two threads running at different rates, a classic but tricky problem in real-time robotics.
 
+---
 
-The first thing I learned is that I had 2 compilers on my computer, I had known this, I needed GCC for my machine architecture class where we were using it for C and assembly code that we wrote for our projects, and then I had the MSVC(I don't know the acronym but for Microsoft Visual Studio). But, I have been a huge fan of the work of Chris Lattner and have been recently working on some mojo code. He also made the clang(which i recently learned is pronounced like you are throwing a pan down the stairs, not as "c-lang") as well as the LLVM compiler architecture, MLIR, and Swift, dude is arguably one of the best programmers of all time, in my personal opinion. 
+### Why SPSC? Why Bidirectional?
 
-That being said, I decided to download the Clang compiler so that I could use that instead. I used github copilot to guide me through this process, becuase I assumed it was going to be way more annoying than it was, and didn't really want to deal with it. To my surprise there is a windows package manager?!?!? Who knew? Not me. That was really cool because all i had to run was winget install LLVM.LLVM, and it just installed. Very nifty. with that out of the way it got me situated with my tasks.json file, my c_cpp_properties.json file, and my launch.json file. It turns out this is a pretty manual process if you are making one from scratch, and I haven't yet dug into them, and don't know how much I will. It appears that its more for vscode specific stuff, and that cmake is pretty separate, though I could call cmake build as one of the tasks in the building process. Then i created a simple hello world script and then used   clang++ -fcolor-diagnostics -fansi-escape-codes -g main.cpp -o main.exe followed by .\main.exe to run the script, and we got hello world out! fantastic!
+Typical producer-consumer queues are unidirectional; one thread sends, the other receives. But in our **real-world real-time control system**, we need **two-way communication**:
 
+- An **observer thread** (non-real-time) sends command updates (e.g., state machine changes, shutdown signals).
+- A **real-time thread** sends back data (e.g., sensor readings, control feedback) at a much higher frequency.
 
+### Implementation Highlights
+### Mailbox for Commands
+
+We use a **double-buffered mailbox** to send commands from the non-RT thread to the RT thread. It’s not atomic on the whole `Msg` object (since it's a complex struct), but we use atomic **index swapping** to achieve safe publication.
+This lets us `peek()` from the RT thread without worrying about torn reads.
+
+### Circular Queue for Feedback
+For sending data **from the RT thread to the observer**, we use a **lock-free ring buffer** with a fixed size (power of 2).
+The RT thread `try_push()`s into it at a 20ms rate, and the observer `try_pop()`s every 100ms (will be 2ms rate and 10ms rate when implemented with the motor code).
+All access is done with relaxed/acquire/release memory ordering, and aligned to 64-byte cache lines to avoid false sharing.
